@@ -6,6 +6,7 @@
 """
 
 import os
+import re
 import time
 import threading
 import logging
@@ -43,6 +44,11 @@ NCC_THRESHOLD = 0.70        # 模板匹配阈值（实测 1.0）
 # OCR 关键词：只要识别出这些片段就判定为广告页。
 # 实测 Vision 会把左侧箭头 ⟨ 认成「公」，所以不能要求精确等于「上滑继续看短剧」。
 AD_KEYWORDS_ANY = ("上滑", "继续看短剧", "滑继续看", "上滑继续")
+
+# 倒计时锁定：广告会显示「5s后可继续上滑观看短剧」，倒计时结束前页面锁死，
+# 这时候滑是滑不动的（会被顶回来，卡在中间态）。必须等它走完。
+_COUNTDOWN_RE = re.compile(r"(\d{1,2})\s*(?:s|S|秒)\s*后")
+COUNTDOWN_MAX = 15      # 超过这个秒数视为误识别（OCR 偶尔会把画面数字读进来）
 OCR_MIN_INTERVAL = 0.3      # OCR 最短调用间隔
 NCC_OCR_TRIGGER = 0.50      # 模板分 >= 此值才值得跑 OCR（播放画面实测 0.432）
 OCR_FALLBACK_SEC = 20       # 完全陌生样式的兜底：每 N 秒强制 OCR 一次
@@ -213,6 +219,24 @@ def ocr_texts(rgb):
         return []
 
 
+def parse_countdown(texts):
+    """
+    从 OCR 文本里解析倒计时秒数。返回 (秒数 或 None, 原始片段)。
+    例：「5s后可继续上滑观看短剧」→ (5, '5s后')
+    """
+    joined = "".join(texts)
+    m = _COUNTDOWN_RE.search(joined)
+    if not m:
+        return None, ""
+    try:
+        sec = int(m.group(1))
+    except ValueError:
+        return None, m.group(0)
+    if sec <= 0 or sec > COUNTDOWN_MAX:
+        return None, m.group(0)
+    return sec, m.group(0)
+
+
 def ocr_looks_like_ad(texts):
     joined = "".join(texts)
     return any(k in joined for k in AD_KEYWORDS_ANY)
@@ -321,16 +345,30 @@ def detect(gray, rgb=None, use_ocr=True):
             best_score, best_name, best_loc = sc_val, name, loc
 
     if tpls and best_score >= NCC_THRESHOLD:
-        return "AD", {"mean": mean, "text_px": text_px, "ncc": round(best_score, 3),
-                      "tpl": best_name, "by": "模板", "loc": best_loc}
+        d = {"mean": mean, "text_px": text_px, "ncc": round(best_score, 3),
+             "tpl": best_name, "by": "模板", "loc": best_loc}
+        # 模板命中也要确认有没有倒计时锁定（否则会在锁定期间白滑，卡在半路）
+        if use_ocr and rgb is not None:
+            texts = ocr_texts(rgb)
+            cd, cd_raw = parse_countdown(texts)
+            if cd is not None:
+                d["countdown"] = cd
+                d["countdown_raw"] = cd_raw
+                d["ocr"] = "".join(texts)[:30]
+        return "AD", d
 
     # 模板不达标：只有「有点像」（>= NCC_OCR_TRIGGER）才值得花 33ms 跑 OCR。
     # 播放画面实测最高 0.432，所以常态不会触发 OCR。
     if use_ocr and rgb is not None and best_score >= NCC_OCR_TRIGGER:
         texts = ocr_texts(rgb)
         if ocr_looks_like_ad(texts):
-            return "AD", {"mean": mean, "text_px": text_px, "ncc": round(best_score, 3),
-                          "tpl": best_name, "by": "OCR", "ocr": "".join(texts)[:30]}
+            cd, cd_raw = parse_countdown(texts)
+            d = {"mean": mean, "text_px": text_px, "ncc": round(best_score, 3),
+                 "tpl": best_name, "by": "OCR", "ocr": "".join(texts)[:30]}
+            if cd is not None:
+                d["countdown"] = cd
+                d["countdown_raw"] = cd_raw
+            return "AD", d
         return "PLAYING", {"mean": mean, "text_px": text_px, "ncc": round(best_score, 3),
                            "tpl": best_name, "by": "OCR未命中",
                            "ocr": "".join(texts)[:30]}
@@ -457,6 +495,7 @@ class Monitor:
         self._last_interval = None
         self._last_near_miss = 0.0
         self._last_fallback_ocr = 0.0
+        self._last_countdown = None
 
     # ---- 生命周期 ----
     @property
@@ -666,6 +705,19 @@ class Monitor:
             return
 
         # ---- 命中广告 ----
+        cd = detail.get("countdown")
+        if cd:
+            # 倒计时锁定：这时候滑不动（会被顶回来卡在半路），只能等
+            if cd != self._last_countdown:
+                log.info("倒计时 %ds 中（%s）→ 页面锁定，等待解锁，不动作",
+                         cd, detail.get("countdown_raw", ""))
+                self._last_countdown = cd
+            self._fast_left = FAST_HOLD_TICKS   # 解锁瞬间要立刻抓住，保持快扫
+            self.on_status("ad_wait")
+            self.on_event("ad_countdown", {"sec": cd, "ocr": detail.get("ocr", "")})
+            return
+        self._last_countdown = None
+
         self.stats["ads"] += 1
         self.on_status("ad")
         cx, cy = center_point(frame)

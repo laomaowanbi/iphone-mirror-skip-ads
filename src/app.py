@@ -70,6 +70,7 @@ ICONS = {
     "idle": "⏸",
     "watching": "▶︎",
     "ad": "⚡︎",
+    "ad_wait": "⏳",      # 倒计时锁定中，等解锁
     "ad_skipped": "⚡︎",
     "disconnected": "⚠︎",
     "error": "✕",
@@ -79,6 +80,7 @@ STATUS_TEXT = {
     "idle": "已停止",
     "watching": "监控中",
     "ad": "正在跳过广告",
+    "ad_wait": "广告倒计时中，等解锁",
     "disconnected": "镜像未连接",
     "error": "出错",
 }
@@ -213,7 +215,9 @@ class AppDelegate(NSObject):
     @objc.python_method
     def onEvent(self, kind, info):
         def apply():
-            if kind == "ad_hit":
+            if kind == "ad_countdown":
+                self.last_msg = f"倒计时 {info.get('sec')}s，等解锁后再滑"
+            elif kind == "ad_hit":
                 self.last_msg = f"命中广告 ncc={info.get('ncc')}"
             elif kind == "ad_skipped":
                 self.last_msg = f"已跳过，画面亮度 {info.get('full_mean')}"
