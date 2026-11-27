@@ -1,0 +1,8 @@
+2026-11-27 14:55:36,546 [INFO] 菜单栏 app 启动，日志 /Users/nantiange/Projects/iphone镜像去广告/logs/ad_monitor.log
+2026-11-27 14:56:06,133 [INFO] 菜单栏图标位置 屏幕逻辑坐标 x=0~29 y=0~0  中心(14,0)
+2026-11-27 14:56:06,134 [INFO] 菜单栏 app 启动，日志 /Users/nantiange/Projects/iphone镜像去广告/logs/ad_monitor.log
+2026-11-27 14:56:15,912 [INFO] 菜单栏 app 启动，日志 /Users/nantiange/Projects/iphone镜像去广告/logs/ad_monitor.log
+2026-11-27 14:56:17,418 [INFO] 菜单栏图标 屏幕逻辑坐标 x=1119~1148 y=828~858  中心(1134,15)
+2026-11-27 14:56:33,292 [INFO] 监控启动 interval=3.0s
+2026-11-27 14:56:48,616 [INFO] AD 命中 {'mean': 14.80145263671875, 'text_px': 1058, 'ncc': 0.837} → 跳过 ( 169,  733)
+2026-11-27 14:56:51,663 [INFO] 跳过成功 → PLAYING 画面亮度=75.9
