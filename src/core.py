@@ -14,6 +14,12 @@ import AppKit
 import Quartz
 import numpy as np
 from PIL import Image
+
+try:
+    import cv2
+    _HAS_CV2 = True
+except ImportError:          # 没有 cv2 就退回整区比对（位置一变就失效）
+    _HAS_CV2 = False
 import ApplicationServices as AS
 
 # ---------------- 常量 ----------------
@@ -25,17 +31,21 @@ MENUBAR_H = 30
 # 「上滑继续看短剧」相对窗口 frame 的比例（实测标定）
 TEXT_REL = {"x0": 0.37139, "x1": 0.62139, "y0": 0.92913, "y1": 0.94094}
 CENTER_REL = {"x": 0.49639, "y": 0.93504}
-MONITOR_REL = {"x0": 0.34, "x1": 0.66, "y0": 0.915, "y1": 0.955}
+# 监控区：比实测文字范围（x 0.37~0.62 / y 0.929~0.941）左右各留很大余量，
+# 防止广告字位置漂移或字号变大被截断。配合模板「滑动搜索」，位置变也不影响判定。
+MONITOR_REL = {"x0": 0.22, "x1": 0.78, "y0": 0.895, "y1": 0.975}
 
 # 判定阈值
 BRIGHT_MEAN_AD_MAX = 60.0   # 广告页监控区背景近黑（实测 15.1）
-TEXT_PX_MIN = 300           # 文字像素下限（实测 1083）
+TEXT_PX_MIN = 300           # 文字像素下限（区域放大不影响文字像素总数）
 NCC_THRESHOLD = 0.70        # 模板匹配阈值（实测 1.0）
 
 # OCR 关键词：只要识别出这些片段就判定为广告页。
 # 实测 Vision 会把左侧箭头 ⟨ 认成「公」，所以不能要求精确等于「上滑继续看短剧」。
 AD_KEYWORDS_ANY = ("上滑", "继续看短剧", "滑继续看", "上滑继续")
-OCR_MIN_INTERVAL = 0.3      # OCR 最短调用间隔（实测 23ms，加限频进一步省电）
+OCR_MIN_INTERVAL = 0.3      # OCR 最短调用间隔
+NCC_OCR_TRIGGER = 0.50      # 模板分 >= 此值才值得跑 OCR（播放画面实测 0.432）
+OCR_FALLBACK_SEC = 20       # 完全陌生样式的兜底：每 N 秒强制 OCR 一次
 
 # 滚轮（实测：必须用 CreateScrollWheelEvent2 + Pixel；sign=-1 才是上滑）
 SCROLL_PIXEL = 300
@@ -210,6 +220,18 @@ def ocr_looks_like_ad(texts):
 _TEMPLATE_CACHE = {}
 
 
+def _crop_to_text(tpl, pad=4):
+    """裁到文字包围盒（留 pad 边距）。返回裁剪后的灰度数组。"""
+    mask = (tpl > 95) & (tpl < 185)
+    rows = np.where(mask.sum(axis=1) > 0)[0]
+    cols = np.where(mask.sum(axis=0) > 0)[0]
+    if not len(rows) or not len(cols):
+        return tpl
+    y0, y1 = max(0, rows[0] - pad), min(tpl.shape[0], rows[-1] + pad + 1)
+    x0, x1 = max(0, cols[0] - pad), min(tpl.shape[1], cols[-1] + pad + 1)
+    return tpl[y0:y1, x0:x1]
+
+
 def load_templates():
     """
     加载 assets/template_*.png 全部模板。
@@ -224,6 +246,9 @@ def load_templates():
     for p in paths:
         try:
             g = np.array(Image.open(p).convert("L"), dtype=np.float32)
+            # 关键：裁到文字包围盒。原模板 90% 是黑底，会让「黑底播放画面」也拿到高分
+            # （实测裁剪前播放画面 0.455，裁剪后 0.432，但广告从 0.837 升到 1.000）
+            g = _crop_to_text(g)
             tpls.append((os.path.basename(p), g))
         except Exception as e:
             log.warning("模板加载失败 %s: %s", p, e)
@@ -268,22 +293,37 @@ def detect(gray, rgb=None, use_ocr=True):
     if mean > BRIGHT_MEAN_AD_MAX or text_px < TEXT_PX_MIN:
         return "PLAYING", {"mean": mean, "text_px": text_px}
     tpls = load_templates()
-    best_score, best_name = -1.0, None
+    best_score, best_name, best_loc = -1.0, None, None
+    gh, gw = g.shape
     for name, tpl in tpls:
         t = tpl
-        if t.shape != g.shape:
+        # 模板比监控区还大（用户把窗口缩得很小）→ 等比缩到区域的 70%
+        if t.shape[0] > gh or t.shape[1] > gw:
+            sc = min(gh / t.shape[0], gw / t.shape[1]) * 0.7
             t = np.array(Image.fromarray(t.astype(np.uint8)).resize(
-                (g.shape[1], g.shape[0]), Image.BILINEAR), dtype=np.float32)
-        sc = ncc(g, t)
-        if sc > best_score:
-            best_score, best_name = sc, name
+                (max(8, int(t.shape[1] * sc)), max(8, int(t.shape[0] * sc))),
+                Image.BILINEAR), dtype=np.float32)
+        if _HAS_CV2:
+            # 滑动搜索：文字位置/偏移怎么变都能找到（实测偏移 160px 仍 1.000 命中）
+            res = cv2.matchTemplate(g, t.astype(np.float32), cv2.TM_CCOEFF_NORMED)
+            _, mx, _, mloc = cv2.minMaxLoc(res)
+            sc_val = float(mx)
+            loc = mloc
+        else:
+            if t.shape != g.shape:
+                t = np.array(Image.fromarray(t.astype(np.uint8)).resize(
+                    (gw, gh), Image.BILINEAR), dtype=np.float32)
+            sc_val, loc = ncc(g, t), (0, 0)
+        if sc_val > best_score:
+            best_score, best_name, best_loc = sc_val, name, loc
 
     if tpls and best_score >= NCC_THRESHOLD:
         return "AD", {"mean": mean, "text_px": text_px, "ncc": round(best_score, 3),
-                      "tpl": best_name, "by": "模板"}
+                      "tpl": best_name, "by": "模板", "loc": best_loc}
 
-    # 模板全不达标 → OCR 兜底（只在这里花 23ms）
-    if use_ocr and rgb is not None:
+    # 模板不达标：只有「有点像」（>= NCC_OCR_TRIGGER）才值得花 33ms 跑 OCR。
+    # 播放画面实测最高 0.432，所以常态不会触发 OCR。
+    if use_ocr and rgb is not None and best_score >= NCC_OCR_TRIGGER:
         texts = ocr_texts(rgb)
         if ocr_looks_like_ad(texts):
             return "AD", {"mean": mean, "text_px": text_px, "ncc": round(best_score, 3),
@@ -293,7 +333,7 @@ def detect(gray, rgb=None, use_ocr=True):
                            "ocr": "".join(texts)[:30]}
 
     return "PLAYING", {"mean": mean, "text_px": text_px, "ncc": round(best_score, 3),
-                       "tpl": best_name}
+                       "tpl": best_name, "by": "粗筛"}
 
 
 def check_connected(frame):
@@ -398,6 +438,7 @@ class Monitor:
         self._fast_left = 0
         self._last_interval = None
         self._last_near_miss = 0.0
+        self._last_fallback_ocr = 0.0
 
     # ---- 生命周期 ----
     @property
@@ -591,8 +632,18 @@ class Monitor:
         self._update_frequency(detail.get("mean"))
 
         if state != "AD":
-            # 粗筛通过（暗底+有文字）但所有模板都没匹配上 → 很可能是没见过的广告样式
-            self._check_near_miss(frame, detail)
+            # 兜底：连"有点像"都不到时，也会定期强制 OCR 一次，
+            # 防止出现和已知样式完全不相似的第 N 种广告被永久漏掉
+            if (detail.get("by") == "粗筛"
+                    and time.time() - self._last_fallback_ocr > OCR_FALLBACK_SEC):
+                self._last_fallback_ocr = time.time()
+                texts = ocr_texts(rgb) if rgb is not None else []
+                if ocr_looks_like_ad(texts):
+                    log.info("兜底 OCR 命中: %s", "".join(texts)[:30])
+                    state = "AD"
+                    detail = dict(detail, by="OCR兜底", ocr="".join(texts)[:30])
+            if state != "AD":
+                self._check_near_miss(frame, detail)
             self.on_status("watching")
             return
 
