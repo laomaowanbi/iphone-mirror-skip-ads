@@ -48,9 +48,12 @@ NCC_OCR_TRIGGER = 0.50      # 模板分 >= 此值才值得跑 OCR（播放画面
 OCR_FALLBACK_SEC = 20       # 完全陌生样式的兜底：每 N 秒强制 OCR 一次
 
 # 滚轮（实测：必须用 CreateScrollWheelEvent2 + Pixel；sign=-1 才是上滑）
-SCROLL_PIXEL = 300
+# 300px×4 档有时滑不到底（页面停在半路，文字上移出监控区→失明），
+# 现改为首次 600×6，失败后按 SCROLL_ATTEMPTS 递增重试
+SCROLL_PIXEL = 600
 SCROLL_SIGN = -1
-SCROLL_STEPS = 4
+SCROLL_STEPS = 6
+SCROLL_ATTEMPTS = [(600, 6), (900, 6), (1200, 8)]   # 依次尝试的 (像素, 步数)
 
 # 动作时序（压缩后）；ACT_WAIT_FOCUS 是关键，太短会导致滚轮无效
 ACT_WAIT_FOCUS = 0.25
@@ -387,7 +390,7 @@ def _scroll_px(delta, steps=SCROLL_STEPS):
         time.sleep(0.03)
 
 
-def skip_ad_at(px, py):
+def skip_ad_at(px, py, pixel=None, steps=None):
     """
     完整跳过：移入 → 点击激活 → 滚轮上滚 → 鼠标复位。
 
@@ -401,8 +404,23 @@ def skip_ad_at(px, py):
     time.sleep(ACT_WAIT_FOCUS)
     _move_mouse(px, py, steps=3)
     time.sleep(0.08)
-    _scroll_px(SCROLL_SIGN * SCROLL_PIXEL)
+    _scroll_px(SCROLL_SIGN * (pixel if pixel else SCROLL_PIXEL),
+               steps=steps if steps else SCROLL_STEPS)
     Quartz.CGWarpMouseCursorPosition((orig.x, orig.y))
+
+
+def ad_text_visible_anywhere(frame):
+    """
+    在窗口下部 45% 范围里找「上滑继续看短剧」。
+    用于滚动后验证：滚动过程中文字会整体上移，固定监控区可能已经看不到它，
+    但页面其实还停在广告页。这里用 OCR 在整个下半部找，不受位置限制。
+    """
+    x, y, w, h = frame
+    band = grab_region(x, y + 0.55 * h, w, 0.45 * h)
+    if band is None:
+        return None
+    texts = ocr_texts(band)
+    return ocr_looks_like_ad(texts)
 
 
 # ---------------- 监控器 ----------------
@@ -656,8 +674,21 @@ class Monitor:
         log.info("AD 命中 %s → 跳过 (%.0f, %.0f) 存证=%s", detail, cx, cy,
                  os.path.basename(shot) if shot else "无")
         self.on_event("ad_hit", dict(detail, x=cx, y=cy))
-        skip_ad_at(cx, cy)
-        self._stop.wait(0.45)
+
+        # 滚动可能滑不到底（页面停半路），失败就加大力度重试
+        for attempt, (px, steps) in enumerate(SCROLL_ATTEMPTS, 1):
+            skip_ad_at(cx, cy, pixel=px, steps=steps)
+            self._stop.wait(0.9)
+            _, frame_now = get_window()
+            if frame_now is None:
+                break
+            still = ad_text_visible_anywhere(frame_now)
+            log.info("第 %d 次滚动 (%dpx×%d) → 广告文字仍可见=%s", attempt, px, steps, still)
+            if not still:
+                break
+            if self._stop.is_set():
+                return
+        frame = frame_now or frame
 
         # ---- 验证：不仅监控区无文字，整窗也要恢复成有画面的正片 ----
         _, gray2 = snapshot(frame)
