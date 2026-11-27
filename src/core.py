@@ -37,6 +37,15 @@ SCROLL_PIXEL = 300
 SCROLL_SIGN = -1
 SCROLL_STEPS = 4
 
+# 动作时序（压缩后）；ACT_WAIT_FOCUS 是关键，太短会导致滚轮无效
+ACT_WAIT_FOCUS = 0.25
+
+# ---- 自适应监控频率 ----
+SLOW_INTERVAL = 0.5    # 常态间隔（实测 CPU 0.6%，可忽略）
+FAST_INTERVAL = 0.15   # 检测到画面变暗时的快扫间隔
+DARK_DROP_RATIO = 0.25 # 亮度比上次下降超过这个比例 → 判定「可能进广告」
+FAST_HOLD_TICKS = 15   # 快扫模式最多维持多少轮，之后回落到常态
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TEMPLATE_PATH = os.path.join(ROOT, "assets", "template_ad_text.png")
@@ -128,14 +137,41 @@ def snapshot(frame):
 _TEMPLATE_CACHE = {}
 
 
+def load_templates():
+    """
+    加载 assets/template_*.png 全部模板。
+    广告有多个样式（实测遇到过 2 种：「上滑继续看短剧 ⟨」和「⟨ 上滑继续看短剧」），
+    必须多模板取最高分，否则换了样式的广告会漏检。
+    """
+    if "list" in _TEMPLATE_CACHE:
+        return _TEMPLATE_CACHE["list"]
+    import glob
+    paths = sorted(glob.glob(os.path.join(ROOT, "assets", "template_*.png")))
+    tpls = []
+    for p in paths:
+        try:
+            g = np.array(Image.open(p).convert("L"), dtype=np.float32)
+            tpls.append((os.path.basename(p), g))
+        except Exception as e:
+            log.warning("模板加载失败 %s: %s", p, e)
+    _TEMPLATE_CACHE["list"] = tpls
+    if tpls:
+        log.info("已加载 %d 个模板: %s", len(tpls), [n for n, _ in tpls])
+    else:
+        log.warning("没有可用模板！请把广告截图存到 assets/template_*.png")
+    return tpls
+
+
 def load_template():
-    if "g" in _TEMPLATE_CACHE:
-        return _TEMPLATE_CACHE["g"]
-    if not os.path.exists(TEMPLATE_PATH):
-        return None
-    g = np.array(Image.open(TEMPLATE_PATH).convert("L"), dtype=np.float32)
-    _TEMPLATE_CACHE["g"] = g
-    return g
+    """兼容旧接口：返回第一个模板。"""
+    tpls = load_templates()
+    return tpls[0][1] if tpls else None
+
+
+def reload_templates():
+    """清缓存重新加载（加新模板后不必重启）。"""
+    _TEMPLATE_CACHE.clear()
+    return load_templates()
 
 
 def ncc(a, b):
@@ -152,15 +188,24 @@ def detect(gray):
     text_px = int(((g > 100) & (g < 175)).sum())
     if mean > BRIGHT_MEAN_AD_MAX or text_px < TEXT_PX_MIN:
         return "PLAYING", {"mean": mean, "text_px": text_px}
-    tpl = load_template()
-    if tpl is None:
+    tpls = load_templates()
+    if not tpls:
         return "PLAYING", {"mean": mean, "text_px": text_px, "note": "无模板"}
-    if tpl.shape != g.shape:
-        tpl = np.array(Image.fromarray(tpl.astype(np.uint8)).resize(
-            (g.shape[1], g.shape[0]), Image.BILINEAR), dtype=np.float32)
-    score = ncc(g, tpl)
-    return ("AD" if score >= NCC_THRESHOLD else "PLAYING",
-            {"mean": mean, "text_px": text_px, "ncc": round(score, 3)})
+
+    best_score, best_name = -1.0, None
+    for name, tpl in tpls:
+        t = tpl
+        if t.shape != g.shape:
+            t = np.array(Image.fromarray(t.astype(np.uint8)).resize(
+                (g.shape[1], g.shape[0]), Image.BILINEAR), dtype=np.float32)
+        sc = ncc(g, t)
+        if sc > best_score:
+            best_score, best_name = sc, name
+
+    hit = best_score >= NCC_THRESHOLD
+    return ("AD" if hit else "PLAYING",
+            {"mean": mean, "text_px": text_px, "ncc": round(best_score, 3),
+             "tpl": best_name, "hit": hit})
 
 
 def check_connected(frame):
@@ -191,7 +236,7 @@ def _move_mouse(px, py, steps=5):
         ev = Quartz.CGEventCreateMouseEvent(src, Quartz.kCGEventMouseMoved,
                                             Quartz.CGPointMake(ix, iy), 0)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-        time.sleep(0.02)
+        time.sleep(0.01)
     Quartz.CGWarpMouseCursorPosition((px, py))
 
 
@@ -215,16 +260,20 @@ def _scroll_px(delta, steps=SCROLL_STEPS):
 
 
 def skip_ad_at(px, py):
-    """完整跳过：移入 → 点击激活 → 滚轮上滚 → 鼠标复位。"""
+    """
+    完整跳过：移入 → 点击激活 → 滚轮上滚 → 鼠标复位。
+
+    各 sleep 已压到能生效的下限（原序列 1.74s → 现 0.69s）。
+    若发现偶发失效，优先调大 ACT_WAIT_FOCUS（点击后等 iOS 接管的时长）。
+    """
     orig = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
-    _move_mouse(px, py)
-    time.sleep(0.25)
+    _move_mouse(px, py, steps=3)
+    time.sleep(0.12)
     _click_at(px, py)
-    time.sleep(0.5)
-    _move_mouse(px, py)
-    time.sleep(0.15)
+    time.sleep(ACT_WAIT_FOCUS)
+    _move_mouse(px, py, steps=3)
+    time.sleep(0.08)
     _scroll_px(SCROLL_SIGN * SCROLL_PIXEL)
-    time.sleep(0.35)
     Quartz.CGWarpMouseCursorPosition((orig.x, orig.y))
 
 
@@ -237,8 +286,12 @@ class Monitor:
       on_status(state)      state ∈ {idle, watching, ad, disconnected, error}
     """
 
-    def __init__(self, interval=3.0, on_event=None, on_status=None, shots_dir=None):
-        self.interval = interval
+    def __init__(self, interval=None, on_event=None, on_status=None, shots_dir=None,
+                 slow_interval=SLOW_INTERVAL, fast_interval=FAST_INTERVAL):
+        # interval 兼容旧接口：传了就当常态间隔
+        self.slow_interval = interval if interval else slow_interval
+        self.fast_interval = fast_interval
+        self.interval = self.slow_interval
         self.shots_dir = shots_dir
         self.max_shots = 200
         if shots_dir:
@@ -253,6 +306,10 @@ class Monitor:
         self._last_conn_check = 0.0
         self._last_frame = None
         self._shot_seq = 0
+        self._prev_mean = None
+        self._fast_left = 0
+        self._last_interval = None
+        self._last_near_miss = 0.0
 
     # ---- 生命周期 ----
     @property
@@ -273,6 +330,52 @@ class Monitor:
             self._thread.join(timeout=6)
         self._thread = None
         self.on_status("idle")
+
+    def _check_near_miss(self, frame, detail):
+        """像广告但模板对不上 → 存证 + 警告（60 秒内只报一次，避免刷屏）。"""
+        if (detail.get("text_px", 0) < TEXT_PX_MIN
+                or detail.get("mean", 999) >= BRIGHT_MEAN_AD_MAX):
+            return
+        now = time.time()
+        if now - self._last_near_miss < 60:
+            return
+        self._last_near_miss = now
+        path = None
+        if self.shots_dir:
+            arr, _ = snapshot(frame)
+            path = self.save_shot(arr, "UNKNOWN_AD_STYLE")
+        log.warning("疑似新广告样式（模板未匹配 ncc=%s, mean=%.1f, text_px=%d）存证=%s"
+                    " → 请把这张图加到 assets/template_ad_textN.png",
+                    detail.get("ncc"), detail.get("mean", 0), detail.get("text_px", 0),
+                    os.path.basename(path) if path else "无")
+        self.on_event("unknown_style", {"detail": detail,
+                                        "shot": os.path.basename(path) if path else None})
+
+    # ---- 自适应频率 ----
+    def _update_frequency(self, mean):
+        """
+        画面突然变暗（广告开始）→ 切快扫，最快捕捉到「上滑继续看短剧」出现的那一刻。
+        短剧画面本身的明暗变化会误触发，但代价只是短暂提高采样率，无害。
+        """
+        if mean is None:
+            return
+        if self._prev_mean and self._prev_mean > 1:
+            drop = (self._prev_mean - mean) / self._prev_mean
+            if drop > DARK_DROP_RATIO:
+                if self._fast_left <= 0:
+                    log.debug("亮度骤降 %.0f→%.0f (%.0f%%) → 快扫模式",
+                              self._prev_mean, mean, drop * 100)
+                self._fast_left = FAST_HOLD_TICKS
+        if self._fast_left > 0:
+            self._fast_left -= 1
+        self._prev_mean = mean
+
+    def _current_interval(self):
+        iv = self.fast_interval if self._fast_left > 0 else self.slow_interval
+        if iv != self._last_interval:
+            log.debug("采样间隔 %.2fs → %.2fs", self._last_interval or 0, iv)
+            self._last_interval = iv
+        return iv
 
     # ---- 存证（出问题时唯一能回看的证据）----
     def save_shot(self, arr, tag, jpeg_quality=0, scale=1.0):
@@ -327,6 +430,8 @@ class Monitor:
             "template": (f"{tpl.shape[1]}x{tpl.shape[0]}" if tpl is not None else "无"),
             "thresholds": f"mean<{BRIGHT_MEAN_AD_MAX} text_px>={TEXT_PX_MIN} ncc>={NCC_THRESHOLD}",
             "scroll": f"sign={SCROLL_SIGN} pixel={SCROLL_PIXEL} steps={SCROLL_STEPS}",
+            "interval": f"slow={self.slow_interval}s fast={self.fast_interval}s "
+                        f"drop>{DARK_DROP_RATIO}",
         }
 
     # ---- 主循环 ----
@@ -342,7 +447,8 @@ class Monitor:
                     log.exception("tick 异常")
                     self.on_event("error", {"msg": self.last_error})
                     self.on_status("error")
-                self._stop.wait(self.interval)
+                    self._fast_left = 0
+                self._stop.wait(self._current_interval())
         finally:
             log.info("监控结束 stats=%s", self.stats)
             self.on_event("stopped", dict(self.stats))
@@ -389,8 +495,11 @@ class Monitor:
             self.on_event("error", {"msg": "监控区截图失败"})
             return
         state, detail = detect(gray)
+        self._update_frequency(detail.get("mean"))
 
         if state != "AD":
+            # 粗筛通过（暗底+有文字）但所有模板都没匹配上 → 很可能是没见过的广告样式
+            self._check_near_miss(frame, detail)
             self.on_status("watching")
             return
 
@@ -404,7 +513,7 @@ class Monitor:
                  os.path.basename(shot) if shot else "无")
         self.on_event("ad_hit", dict(detail, x=cx, y=cy))
         skip_ad_at(cx, cy)
-        self._stop.wait(1.2)
+        self._stop.wait(0.45)
 
         # ---- 验证：不仅监控区无文字，整窗也要恢复成有画面的正片 ----
         _, gray2 = snapshot(frame)
@@ -427,4 +536,5 @@ class Monitor:
             log.warning("跳过可能失败 → %s 画面亮度=%.1f 存证=%s", state2, full_mean,
                         os.path.basename(fail_shot) if fail_shot else "无")
             self.on_event("ad_failed", {"state": state2, "full_mean": round(full_mean, 1)})
-        self._stop.wait(2.5)
+        self._fast_left = 0
+        self._stop.wait(0.8)

@@ -257,8 +257,7 @@ class AppDelegate(NSObject):
             self.refreshUI()
             return
 
-        self.monitor = core.Monitor(interval=3.0,
-                                    on_event=self.onEvent,
+        self.monitor = core.Monitor(on_event=self.onEvent,
                                     on_status=self.onStatus,
                                     shots_dir=SHOTS_DIR)
         self.monitor.start()
