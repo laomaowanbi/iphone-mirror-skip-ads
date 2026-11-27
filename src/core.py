@@ -237,8 +237,12 @@ class Monitor:
       on_status(state)      state ∈ {idle, watching, ad, disconnected, error}
     """
 
-    def __init__(self, interval=3.0, on_event=None, on_status=None):
+    def __init__(self, interval=3.0, on_event=None, on_status=None, shots_dir=None):
         self.interval = interval
+        self.shots_dir = shots_dir
+        self.max_shots = 200
+        if shots_dir:
+            os.makedirs(shots_dir, exist_ok=True)
         self.on_event = on_event or (lambda *a: None)
         self.on_status = on_status or (lambda *a: None)
         self._stop = threading.Event()
@@ -247,6 +251,8 @@ class Monitor:
                       "disconnected": 0}
         self.last_error = ""
         self._last_conn_check = 0.0
+        self._last_frame = None
+        self._shot_seq = 0
 
     # ---- 生命周期 ----
     @property
@@ -268,6 +274,61 @@ class Monitor:
         self._thread = None
         self.on_status("idle")
 
+    # ---- 存证（出问题时唯一能回看的证据）----
+    def save_shot(self, arr, tag, jpeg_quality=0, scale=1.0):
+        """
+        把截图存进 shots_dir，带时间戳和标签；超过上限自动删最旧的。
+
+        jpeg_quality > 0 时存 JPEG（整窗大图必须用，否则单张近 900KB）
+        scale < 1.0 时先缩小
+        """
+        if not self.shots_dir or arr is None:
+            return None
+        try:
+            self._shot_seq += 1
+            img = Image.fromarray(arr)
+            if scale != 1.0:
+                img = img.resize((max(1, int(img.width * scale)),
+                                  max(1, int(img.height * scale))), Image.LANCZOS)
+            if jpeg_quality:
+                ext = "jpg"
+                path = os.path.join(
+                    self.shots_dir,
+                    f"{time.strftime('%Y%m%d-%H%M%S')}_{tag}_{self._shot_seq:03d}.{ext}")
+                img.save(path, "JPEG", quality=jpeg_quality, optimize=True)
+            else:
+                path = os.path.join(
+                    self.shots_dir,
+                    f"{time.strftime('%Y%m%d-%H%M%S')}_{tag}_{self._shot_seq:03d}.png")
+                img.save(path)
+            files = sorted(
+                (os.path.join(self.shots_dir, f) for f in os.listdir(self.shots_dir)
+                 if f.endswith((".png", ".jpg"))),
+                key=os.path.getmtime)
+            for old in files[:-self.max_shots]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+            return path
+        except Exception as e:
+            log.warning("存证失败: %s", e)
+            return None
+
+    def snapshot_env(self, frame):
+        """环境快照，用于复现问题。"""
+        screen = AppKit.NSScreen.mainScreen().frame()
+        tpl = load_template()
+        return {
+            "screen": f"{screen.size.width:.0f}x{screen.size.height:.0f}",
+            "window": f"({frame[0]:.0f},{frame[1]:.0f}) {frame[2]:.0f}x{frame[3]:.0f}",
+            "ratio": round(frame[2] / frame[3], 5),
+            "monitor_box": tuple(round(v, 1) for v in monitor_box(frame)),
+            "template": (f"{tpl.shape[1]}x{tpl.shape[0]}" if tpl is not None else "无"),
+            "thresholds": f"mean<{BRIGHT_MEAN_AD_MAX} text_px>={TEXT_PX_MIN} ncc>={NCC_THRESHOLD}",
+            "scroll": f"sign={SCROLL_SIGN} pixel={SCROLL_PIXEL} steps={SCROLL_STEPS}",
+        }
+
     # ---- 主循环 ----
     def _loop(self):
         self.on_event("started", {})
@@ -288,6 +349,7 @@ class Monitor:
 
     def _tick(self):
         self.stats["checks"] += 1
+        log.debug("tick #%d", self.stats["checks"])
         app = find_app()
         if app is None:
             self.on_status("error")
@@ -301,6 +363,15 @@ class Monitor:
             self.on_event("error", {"msg": "读不到镜像窗口"})
             self._stop.wait(5)
             return
+
+        # 窗口位置/尺寸变了 → 坐标会算错，必须留痕
+        if self._last_frame != frame:
+            if self._last_frame is None:
+                log.info("环境快照 %s", self.snapshot_env(frame))
+            else:
+                log.warning("窗口变化 %s → %s  (环境: %s)", self._last_frame, frame,
+                            self.snapshot_env(frame))
+            self._last_frame = frame
 
         # 每 15 秒检查一次镜像是否断开（截图有成本）
         now = time.time()
@@ -327,7 +398,10 @@ class Monitor:
         self.stats["ads"] += 1
         self.on_status("ad")
         cx, cy = center_point(frame)
-        log.info("AD 命中 %s → 跳过 (% .0f, % .0f)", detail, cx, cy)
+        shot = self.save_shot(
+            snapshot(frame)[0], f"adhit_ncc{detail.get('ncc')}") if self.shots_dir else None
+        log.info("AD 命中 %s → 跳过 (%.0f, %.0f) 存证=%s", detail, cx, cy,
+                 os.path.basename(shot) if shot else "无")
         self.on_event("ad_hit", dict(detail, x=cx, y=cy))
         skip_ad_at(cx, cy)
         self._stop.wait(1.2)
@@ -345,6 +419,12 @@ class Monitor:
             self.on_status("watching")
         else:
             self.stats["failed"] += 1
-            log.warning("跳过可能失败 → %s 画面亮度=%.1f", state2, full_mean)
+            fail_shot = None
+            if self.shots_dir:
+                full_win = grab_region(x, y, w, h)
+                fail_shot = self.save_shot(full_win, "ADFAIL_fullwindow",
+                                           jpeg_quality=75, scale=0.75)
+            log.warning("跳过可能失败 → %s 画面亮度=%.1f 存证=%s", state2, full_mean,
+                        os.path.basename(fail_shot) if fail_shot else "无")
             self.on_event("ad_failed", {"state": state2, "full_mean": round(full_mean, 1)})
         self._stop.wait(2.5)

@@ -33,14 +33,36 @@ LOG_DIR = os.path.join(ROOT, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_PATH = os.path.join(LOG_DIR, "ad_monitor.log")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_PATH, encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
+from logging.handlers import RotatingFileHandler
+
+SHOTS_DIR = os.path.join(ROOT, "logs", "shots")
+os.makedirs(SHOTS_DIR, exist_ok=True)
+
+_fmt = logging.Formatter("%(asctime)s [%(levelname)-7s] %(name)s: %(message)s")
+
+# 主日志：轮转，5MB × 5 份
+_main = RotatingFileHandler(LOG_PATH, maxBytes=5 * 1024 * 1024,
+                            backupCount=5, encoding="utf-8")
+_main.setFormatter(_fmt)
+_main.setLevel(logging.DEBUG)
+
+# 错误单独一份，排查时只看它
+_err = RotatingFileHandler(os.path.join(LOG_DIR, "errors.log"),
+                           maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+_err.setFormatter(_fmt)
+_err.setLevel(logging.WARNING)
+
+_console = logging.StreamHandler()
+_console.setFormatter(_fmt)
+_console.setLevel(logging.INFO)
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+# 第三方库噪音太大，只留警告
+for noisy in ("PIL", "urllib3", "Quartz"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+for h in (_main, _err, _console):
+    root_logger.addHandler(h)
 log = logging.getLogger("app")
 
 ICONS = {
@@ -137,6 +159,11 @@ class AppDelegate(NSObject):
         item_log.setTarget_(self)
         menu.addItem_(item_log)
 
+        item_shots = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "打开存证截图文件夹", "openShots:", "")
+        item_shots.setTarget_(self)
+        menu.addItem_(item_shots)
+
         item_quit = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "退出", "quitApp:", "q")
         item_quit.setTarget_(self)
@@ -168,6 +195,8 @@ class AppDelegate(NSObject):
 
     @objc.python_method
     def onStatus(self, state):
+        if state != self.state:
+            log.info("状态 %s → %s", self.state, state)
         def apply():
             self.state = state
             self.refreshUI()
@@ -230,7 +259,8 @@ class AppDelegate(NSObject):
 
         self.monitor = core.Monitor(interval=3.0,
                                     on_event=self.onEvent,
-                                    on_status=self.onStatus)
+                                    on_status=self.onStatus,
+                                    shots_dir=SHOTS_DIR)
         self.monitor.start()
         self.state = "watching"
         self.last_msg = f"窗口 ({frame[0]:.0f},{frame[1]:.0f}) {frame[2]:.0f}x{frame[3]:.0f}"
@@ -272,6 +302,10 @@ class AppDelegate(NSObject):
         NSApp.activateIgnoringOtherApps_(True)
         AppKit.NSWorkspace.sharedWorkspace().openFile_(LOG_PATH)
 
+    def openShots_(self, sender):
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        AppKit.NSWorkspace.sharedWorkspace().openFile_(SHOTS_DIR)
+
     def quitApp_(self, sender):
         if self.monitor and self.monitor.running:
             self.monitor.stop()
@@ -282,7 +316,15 @@ class AppDelegate(NSObject):
     def applicationDidFinishLaunching_(self, notification):
         self.buildMenu()
         self.refreshUI()
-        log.info("菜单栏 app 启动，日志 %s", LOG_PATH)
+        app_w, frame = core.get_window(core.find_app())
+        env = self.monitor.snapshot_env(frame) if (self.monitor and frame) else None
+        if frame:
+            m = core.Monitor(shots_dir=SHOTS_DIR)
+            log.info("启动 环境=%s", m.snapshot_env(frame))
+        else:
+            log.info("启动（镜像未运行）")
+        log.info("日志=%s  存证=%s  错误日志=%s", LOG_PATH, SHOTS_DIR,
+                 os.path.join(LOG_DIR, "errors.log"))
 
 
 def main():

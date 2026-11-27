@@ -1,8 +1,44 @@
-2026-11-27 14:55:36,546 [INFO] 菜单栏 app 启动，日志 /Users/nantiange/Projects/iphone镜像去广告/logs/ad_monitor.log
-2026-11-27 14:56:06,133 [INFO] 菜单栏图标位置 屏幕逻辑坐标 x=0~29 y=0~0  中心(14,0)
-2026-11-27 14:56:06,134 [INFO] 菜单栏 app 启动，日志 /Users/nantiange/Projects/iphone镜像去广告/logs/ad_monitor.log
-2026-11-27 14:56:15,912 [INFO] 菜单栏 app 启动，日志 /Users/nantiange/Projects/iphone镜像去广告/logs/ad_monitor.log
-2026-11-27 14:56:17,418 [INFO] 菜单栏图标 屏幕逻辑坐标 x=1119~1148 y=828~858  中心(1134,15)
-2026-11-27 14:56:33,292 [INFO] 监控启动 interval=3.0s
-2026-11-27 14:56:48,616 [INFO] AD 命中 {'mean': 14.80145263671875, 'text_px': 1058, 'ncc': 0.837} → 跳过 ( 169,  733)
-2026-11-27 14:56:51,663 [INFO] 跳过成功 → PLAYING 画面亮度=75.9
+2026-11-27 14:58:11,086 [DEBUG  ] PIL.PngImagePlugin: STREAM b'IHDR' 16 13
+2026-11-27 14:58:11,086 [DEBUG  ] PIL.PngImagePlugin: STREAM b'IDAT' 41 6196
+2026-11-27 14:58:11,087 [INFO   ] app: 启动 环境={'screen': '2048x858', 'window': '(0,31) 341x751', 'ratio': 0.45406, 'monitor_box': (115.9, 718.2, 109.1, 30.0), 'template': '220x60', 'thresholds': 'mean<60.0 text_px>=300 ncc>=0.7', 'scroll': 'sign=-1 pixel=300 steps=4'}
+2026-11-27 14:58:11,087 [INFO   ] app: 日志=/Users/nantiange/Projects/iphone镜像去广告/logs/ad_monitor.log  存证=/Users/nantiange/Projects/iphone镜像去广告/logs/shots  错误日志=/Users/nantiange/Projects/iphone镜像去广告/logs/errors.log
+2026-11-27 14:58:12,596 [INFO   ] app: 菜单栏图标 屏幕逻辑坐标 x=1119~1148 y=828~858  中心(1134,15)
+2026-11-27 14:58:19,027 [INFO   ] app: 启动 环境={'screen': '2048x858', 'window': '(0,31) 341x751', 'ratio': 0.45406, 'monitor_box': (115.9, 718.2, 109.1, 30.0), 'template': '220x60', 'thresholds': 'mean<60.0 text_px>=300 ncc>=0.7', 'scroll': 'sign=-1 pixel=300 steps=4'}
+2026-11-27 14:58:19,027 [INFO   ] app: 日志=/Users/nantiange/Projects/iphone镜像去广告/logs/ad_monitor.log  存证=/Users/nantiange/Projects/iphone镜像去广告/logs/shots  错误日志=/Users/nantiange/Projects/iphone镜像去广告/logs/errors.log
+2026-11-27 14:58:20,534 [INFO   ] app: 菜单栏图标 屏幕逻辑坐标 x=1119~1148 y=828~858  中心(1134,15)
+2026-11-27 14:58:27,818 [INFO   ] core: 监控启动 interval=3.0s
+2026-11-27 14:58:27,818 [DEBUG  ] core: tick #1
+2026-11-27 14:58:27,819 [INFO   ] core: 环境快照 {'screen': '2048x858', 'window': '(0,30) 341x751', 'ratio': 0.45406, 'monitor_box': (115.9, 717.2, 109.1, 30.0), 'template': '220x60', 'thresholds': 'mean<60.0 text_px>=300 ncc>=0.7', 'scroll': 'sign=-1 pixel=300 steps=4'}
+2026-11-27 14:58:30,866 [DEBUG  ] core: tick #2
+2026-11-27 14:58:33,923 [DEBUG  ] core: tick #3
+2026-11-27 14:58:36,973 [DEBUG  ] core: tick #4
+2026-11-27 14:58:40,023 [DEBUG  ] core: tick #5
+2026-11-27 14:58:43,073 [DEBUG  ] core: tick #6
+2026-11-27 14:58:46,162 [DEBUG  ] core: tick #7
+2026-11-27 14:58:49,215 [DEBUG  ] core: tick #8
+2026-11-27 14:58:52,274 [DEBUG  ] core: tick #9
+2026-11-27 14:58:55,329 [DEBUG  ] core: tick #10
+2026-11-27 14:58:58,392 [DEBUG  ] core: tick #11
+2026-11-27 14:59:01,480 [DEBUG  ] core: tick #12
+2026-11-27 14:59:04,539 [DEBUG  ] core: tick #13
+2026-11-27 14:59:07,594 [DEBUG  ] core: tick #14
+2026-11-27 14:59:10,649 [DEBUG  ] core: tick #15
+2026-11-27 14:59:13,685 [DEBUG  ] core: tick #16
+2026-11-27 14:59:16,777 [DEBUG  ] core: tick #17
+2026-11-27 14:59:19,836 [DEBUG  ] core: tick #18
+2026-11-27 14:59:22,889 [DEBUG  ] core: tick #19
+2026-11-27 14:59:25,940 [DEBUG  ] core: tick #20
+2026-11-27 14:59:28,993 [DEBUG  ] core: tick #21
+2026-11-27 14:59:32,080 [DEBUG  ] core: tick #22
+2026-11-27 14:59:35,124 [DEBUG  ] core: tick #23
+2026-11-27 14:59:38,176 [DEBUG  ] core: tick #24
+2026-11-27 14:59:41,231 [DEBUG  ] core: tick #25
+2026-11-27 14:59:44,293 [DEBUG  ] core: tick #26
+2026-11-27 14:59:47,380 [DEBUG  ] core: tick #27
+2026-11-27 14:59:50,443 [DEBUG  ] core: tick #28
+2026-11-27 14:59:53,495 [DEBUG  ] core: tick #29
+2026-11-27 14:59:56,541 [DEBUG  ] core: tick #30
+2026-11-27 14:59:59,591 [DEBUG  ] core: tick #31
+2026-11-27 15:00:03,739 [INFO   ] app: 启动 环境={'screen': '2048x858', 'window': '(0,30) 341x751', 'ratio': 0.45406, 'monitor_box': (115.9, 717.2, 109.1, 30.0), 'template': '220x60', 'thresholds': 'mean<60.0 text_px>=300 ncc>=0.7', 'scroll': 'sign=-1 pixel=300 steps=4'}
+2026-11-27 15:00:03,739 [INFO   ] app: 日志=/Users/nantiange/Projects/iphone镜像去广告/logs/ad_monitor.log  存证=/Users/nantiange/Projects/iphone镜像去广告/logs/shots  错误日志=/Users/nantiange/Projects/iphone镜像去广告/logs/errors.log
+2026-11-27 15:00:05,249 [INFO   ] app: 菜单栏图标 屏幕逻辑坐标 x=1119~1148 y=828~858  中心(1134,15)
