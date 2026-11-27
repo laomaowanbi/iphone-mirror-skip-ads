@@ -32,6 +32,11 @@ BRIGHT_MEAN_AD_MAX = 60.0   # 广告页监控区背景近黑（实测 15.1）
 TEXT_PX_MIN = 300           # 文字像素下限（实测 1083）
 NCC_THRESHOLD = 0.70        # 模板匹配阈值（实测 1.0）
 
+# OCR 关键词：只要识别出这些片段就判定为广告页。
+# 实测 Vision 会把左侧箭头 ⟨ 认成「公」，所以不能要求精确等于「上滑继续看短剧」。
+AD_KEYWORDS_ANY = ("上滑", "继续看短剧", "滑继续看", "上滑继续")
+OCR_MIN_INTERVAL = 0.3      # OCR 最短调用间隔（实测 23ms，加限频进一步省电）
+
 # 滚轮（实测：必须用 CreateScrollWheelEvent2 + Pixel；sign=-1 才是上滑）
 SCROLL_PIXEL = 300
 SCROLL_SIGN = -1
@@ -132,6 +137,74 @@ def snapshot(frame):
     return arr, arr.mean(axis=2)
 
 
+# ---------------- OCR（macOS Vision，动态加载免安装） ----------------
+
+_VISION = {"state": None}
+
+
+def _load_vision():
+    if _VISION["state"] is not None:
+        return _VISION["state"] == "ok"
+    try:
+        import objc
+        ns = {}
+        objc.loadBundle("Vision", ns,
+                        bundle_path="/System/Library/Frameworks/Vision.framework")
+        req_cls = ns.get("VNRecognizeTextRequest")
+        handler_cls = ns.get("VNImageRequestHandler")
+        if req_cls is None or handler_cls is None:
+            raise RuntimeError("Vision 符号不可见")
+        _VISION.update(state="ok", req=req_cls, handler=handler_cls)
+        log.info("Vision OCR 可用（免安装，动态加载）")
+        return True
+    except Exception as e:
+        _VISION["state"] = "fail"
+        log.warning("Vision OCR 不可用，仅靠模板匹配: %s", e)
+        return False
+
+
+def _to_cgimage(rgb):
+    h, w = rgb.shape[:2]
+    rgb = np.ascontiguousarray(rgb)
+    provider = Quartz.CGDataProviderCreateWithData(None, rgb.tobytes(), rgb.nbytes, None)
+    if provider is None:
+        return None
+    return Quartz.CGImageCreate(
+        w, h, 8, 24, w * 3, Quartz.CGColorSpaceCreateDeviceRGB(),
+        Quartz.kCGImageAlphaNone | Quartz.kCGBitmapByteOrderDefault,
+        provider, None, False, 0)
+
+
+def ocr_texts(rgb):
+    """返回识别到的文本片段列表。注：options 必须传 None，传 {} 会报 key does not exist。"""
+    if not _load_vision():
+        return []
+    cg = _to_cgimage(rgb)
+    if cg is None:
+        return []
+    try:
+        req = _VISION["req"].alloc().init()
+        req.setRecognitionLanguages_(["zh-Hans"])
+        req.setRecognitionLevel_(0)          # 0 = fast，实测 23ms
+        req.setUsesLanguageCorrection_(False)
+        h = _VISION["handler"].alloc().initWithCGImage_options_(cg, None)
+        h.performRequests_error_([req], None)
+        out = []
+        for r in (req.results() or []):
+            cands = r.topCandidates_(1)
+            if cands and len(cands):
+                out.append(str(cands[0].string()))
+        return out
+    except Exception as e:
+        log.warning("OCR 失败: %s", e)
+        return []
+
+
+def ocr_looks_like_ad(texts):
+    joined = "".join(texts)
+    return any(k in joined for k in AD_KEYWORDS_ANY)
+
+
 # ---------------- 判定 ----------------
 
 _TEMPLATE_CACHE = {}
@@ -181,17 +254,20 @@ def ncc(a, b):
     return 0.0 if denom < 1e-6 else float((a * b).sum() / denom)
 
 
-def detect(gray):
-    """双层判据。返回 (state, detail)，state ∈ {AD, PLAYING}。"""
+def detect(gray, rgb=None, use_ocr=True):
+    """
+    三级判据。返回 (state, detail)，state ∈ {AD, PLAYING}
+
+    ① 粗筛（微秒）：暗底 + 有中灰文字像素，否则直接 PLAYING
+    ② 模板匹配（0.1ms）：任一模板 NCC 达标 → AD。适合已知样式，最快
+    ③ OCR（23ms）：文字内容含关键词 → AD。免疫排版/字号/位置变化，用于新样式兜底
+    """
     g = gray.astype(np.float32)
     mean = float(g.mean())
     text_px = int(((g > 100) & (g < 175)).sum())
     if mean > BRIGHT_MEAN_AD_MAX or text_px < TEXT_PX_MIN:
         return "PLAYING", {"mean": mean, "text_px": text_px}
     tpls = load_templates()
-    if not tpls:
-        return "PLAYING", {"mean": mean, "text_px": text_px, "note": "无模板"}
-
     best_score, best_name = -1.0, None
     for name, tpl in tpls:
         t = tpl
@@ -202,10 +278,22 @@ def detect(gray):
         if sc > best_score:
             best_score, best_name = sc, name
 
-    hit = best_score >= NCC_THRESHOLD
-    return ("AD" if hit else "PLAYING",
-            {"mean": mean, "text_px": text_px, "ncc": round(best_score, 3),
-             "tpl": best_name, "hit": hit})
+    if tpls and best_score >= NCC_THRESHOLD:
+        return "AD", {"mean": mean, "text_px": text_px, "ncc": round(best_score, 3),
+                      "tpl": best_name, "by": "模板"}
+
+    # 模板全不达标 → OCR 兜底（只在这里花 23ms）
+    if use_ocr and rgb is not None:
+        texts = ocr_texts(rgb)
+        if ocr_looks_like_ad(texts):
+            return "AD", {"mean": mean, "text_px": text_px, "ncc": round(best_score, 3),
+                          "tpl": best_name, "by": "OCR", "ocr": "".join(texts)[:30]}
+        return "PLAYING", {"mean": mean, "text_px": text_px, "ncc": round(best_score, 3),
+                           "tpl": best_name, "by": "OCR未命中",
+                           "ocr": "".join(texts)[:30]}
+
+    return "PLAYING", {"mean": mean, "text_px": text_px, "ncc": round(best_score, 3),
+                       "tpl": best_name}
 
 
 def check_connected(frame):
@@ -332,7 +420,12 @@ class Monitor:
         self.on_status("idle")
 
     def _check_near_miss(self, frame, detail):
-        """像广告但模板对不上 → 存证 + 警告（60 秒内只报一次，避免刷屏）。"""
+        """
+        粗筛通过、但模板和 OCR 都没认定 → 存证 + 警告（60 秒一次）。
+        意味着既不是已知样式，OCR 也没读出广告关键词，需要人工看一眼。
+        """
+        if detail.get("by") != "OCR未命中":
+            return
         if (detail.get("text_px", 0) < TEXT_PX_MIN
                 or detail.get("mean", 999) >= BRIGHT_MEAN_AD_MAX):
             return
@@ -490,11 +583,11 @@ class Monitor:
                 self.on_event("disconnected", info)
                 return
 
-        _, gray = snapshot(frame)
+        rgb, gray = snapshot(frame)
         if gray is None:
             self.on_event("error", {"msg": "监控区截图失败"})
             return
-        state, detail = detect(gray)
+        state, detail = detect(gray, rgb)
         self._update_frequency(detail.get("mean"))
 
         if state != "AD":

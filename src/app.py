@@ -32,6 +32,7 @@ ROOT = core.ROOT
 LOG_DIR = os.path.join(ROOT, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_PATH = os.path.join(LOG_DIR, "ad_monitor.log")
+CONTROL_FILE = os.path.join(ROOT, ".control")   # 写 start / stop 即可控制，无需点菜单
 
 from logging.handlers import RotatingFileHandler
 
@@ -94,6 +95,7 @@ class AppDelegate(NSObject):
         self.state = "idle"
         self.last_msg = ""
         self.pin_window = True
+        self.auto_start = True
         return self
 
     # ---------- UI 构建 ----------
@@ -146,6 +148,12 @@ class AppDelegate(NSObject):
         self.item_pin.setTarget_(self)
         self.item_pin.setState_(1)
         menu.addItem_(self.item_pin)
+
+        self.item_auto = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "启动时自动监控", "toggleAuto:", "")
+        self.item_auto.setTarget_(self)
+        self.item_auto.setState_(1)
+        menu.addItem_(self.item_auto)
 
         self.item_test = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "检测一次（不动作）", "testOnce:", "")
@@ -224,11 +232,22 @@ class AppDelegate(NSObject):
 
     def toggleMonitor_(self, sender):
         if self.monitor and self.monitor.running:
-            log.info("用户停止监控")
+            self.stop_monitor()
+        else:
+            self.start_monitor()
+
+    @objc.python_method
+    def stop_monitor(self):
+        if self.monitor and self.monitor.running:
+            log.info("停止监控")
             self.monitor.stop()
-            self.state = "idle"
-            self.last_msg = "已手动停止"
-            self.refreshUI()
+        self.state = "idle"
+        self.last_msg = "已停止"
+        self.refreshUI()
+
+    @objc.python_method
+    def start_monitor(self):
+        if self.monitor and self.monitor.running:
             return
 
         # 前置检查：镜像在跑吗
@@ -264,6 +283,10 @@ class AppDelegate(NSObject):
         self.state = "watching"
         self.last_msg = f"窗口 ({frame[0]:.0f},{frame[1]:.0f}) {frame[2]:.0f}x{frame[3]:.0f}"
         self.refreshUI()
+
+    def toggleAuto_(self, sender):
+        self.auto_start = not self.auto_start
+        self.item_auto.setState_(1 if self.auto_start else 0)
 
     def togglePin_(self, sender):
         self.pin_window = not self.pin_window
@@ -312,9 +335,59 @@ class AppDelegate(NSObject):
 
     # ---------- 启动 ----------
 
+    @objc.python_method
+    def _control_loop(self):
+        """轮询控制文件：echo start > .control 即可启动监控，echo stop > .control 停止。"""
+        import threading
+        def run():
+            while True:
+                try:
+                    if os.path.exists(CONTROL_FILE):
+                        cmd = open(CONTROL_FILE, encoding="utf-8").read().strip().lower()
+                        os.remove(CONTROL_FILE)
+                        log.info("收到控制命令: %s", cmd)
+                        if cmd in ("start", "开始"):
+                            AppHelper.callAfter(self.start_monitor)
+                        elif cmd in ("stop", "停止"):
+                            AppHelper.callAfter(self.stop_monitor)
+                        elif cmd in ("status", "状态"):
+                            log.info("状态=%s stats=%s", self.state,
+                                     self.monitor.stats if self.monitor else None)
+                except Exception as e:
+                    log.warning("控制文件处理失败: %s", e)
+                time.sleep(0.4)
+        threading.Thread(target=run, name="control", daemon=True).start()
+
+    @objc.python_method
+    def _auto_start(self):
+        """启动后自动开始监控（可用菜单「启动时自动监控」关掉）。"""
+        if not self.auto_start:
+            log.info("自动监控已关闭，等待手动启动")
+            return
+        log.info("自动启动监控")
+        self.start_monitor()
+
+    @objc.python_method
+    def _warmup(self):
+        """后台预热 OCR（首次调用要加载 Vision 模型，约 1 秒，不能让它卡在第一支广告上）。"""
+        import threading
+        def run():
+            try:
+                import numpy as np
+                dummy = np.zeros((60, 218, 3), dtype=np.uint8)
+                t0 = time.time()
+                core.ocr_texts(dummy)
+                log.info("OCR 预热完成 %.0fms", (time.time() - t0) * 1000)
+            except Exception as e:
+                log.warning("OCR 预热失败: %s", e)
+        threading.Thread(target=run, daemon=True).start()
+
     def applicationDidFinishLaunching_(self, notification):
         self.buildMenu()
         self.refreshUI()
+        self._warmup()
+        self._control_loop()
+        AppHelper.callLater(2.0, self._auto_start)
         app_w, frame = core.get_window(core.find_app())
         env = self.monitor.snapshot_env(frame) if (self.monitor and frame) else None
         if frame:
