@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
 .DS_Store
-/assets/*.png
-!/assets/.gitkeep
+
+# 运行产物，不进仓库
+logs/
