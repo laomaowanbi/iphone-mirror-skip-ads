@@ -5,3 +5,6 @@ __pycache__/
 # 运行产物，不进仓库
 logs/
 .control
+
+# 本地备份，不进仓库
+*.bak-*

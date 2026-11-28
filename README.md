@@ -1,8 +1,45 @@
 # iPhone 镜像 · 红果短剧去广告
 
-> 立项日期：2026-11-27
-> 状态：**立项完成，待开发**
-> 目录：`~/projects/iphone镜像去广告/`
+> 当前版本：**v2.0**（2026-11-28）
+> 状态：**已在自用**（菜单栏监控 · 自动跳广告 · 误进商品页自动返回）
+> 目录：`~/projects/iphone镜像去广告/` ｜ GitHub：`laomaowanbi/iphone-mirror-skip-ads`
+
+---
+
+## 0. v2.0 相对 v1.0 改了什么
+
+1. **取帧改用 ScreenCaptureKit 采集器**（`bin/sck_grab`，源码 `bin/sck_grab.swift`）。
+   旧版用截图类 API（`CGDisplayCreateImageForRect`）读镜像画面，iPhone 端会收到一次
+   「用户截图了」事件→ iOS 广播给红果 → 不断弹「已截取纯净页面 / 识图找同款」浮窗
+   （每集 ≈ 320 次）。改成 SCStream 帧回调（录屏流采集语义）后实测**零截图事件**。
+   采集器不在时自动回退旧截图路径（功能照旧但会弹浮窗，日志会警告）。
+2. **误滑进商品页自动点左上角返回**：广告上滑有时进了**抖音商城商品页**（详情页 /
+   视频图集页）而不是正片。现在用 OCR 判「还在商品生态」（强特征词 1 个、或弱特征词 2 个），
+   用**纯白像素质心**动态定位左上角「<」（写死坐标必偏），**最多连点 3 次**（商品生态多层），
+   点不出则存证 + 冷却 60 秒交给用户手动。
+3. **可双击的 App**：`bash scripts/make_app.sh` 一键生成 `~/Applications/iPhone镜像去广告.app`
+   （防双开靠 `logs/app.pid` + `kill -0`，不用 `pgrep -f`——它会误命中任意命令行含
+   `src/app.py` 的进程）。
+4. **菜单栏图标改成媒体按钮语义**：在跑时显示 `⏸`（点它就暂停）、停下时显示 `▶︎`
+   （点它就开始）；**左键直接切换监控，右键弹菜单**。
+   坑：PyObjC 没暴露 `NSStatusBarButton.setSendActionOn_`（button 与它的 cell 都没有），
+   调一下就报 `AttributeError` 并静默中断 `buildMenu`；右键只能靠
+   `NSEvent.addGlobalMonitorForEventsMatchingMask_handler_` 实现。
+5. **版本号集中一处**：`src/app.py` 里的 `VERSION`；App 的 `CFBundleShortVersionString`
+   由 `scripts/make_app.sh` 自动读它，不会两边不一致。
+
+### 首次安装（换机）四步
+
+```bash
+git clone https://github.com/laomaowanbi/iphone-mirror-skip-ads.git ~/projects/iphone镜像去广告
+cd ~/projects/iphone镜像去广告
+swiftc -O -o bin/sck_grab bin/sck_grab.swift      # 编译采集器
+bash scripts/make_app.sh                          # 生成可双击的 App
+open ~/Applications/iPhone镜像去广告.app
+```
+然后**人工开一次屏幕录制授权**（系统设置 → 屏幕录制 → 把列表里的 `sck_grab` 打开），
+重启一次即可。依赖：macOS 15+、iPhone 镜像已连手机、一个 Python 3 解释器
+（默认用 `~/Projects/mcp/.venv/bin/python`，可在 `scripts/launcher.sh` 里改 `PY=`）。
 
 ---
 

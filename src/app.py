@@ -28,6 +28,8 @@ import objc
 
 import core
 
+VERSION = "2.0"          # 改这一行即可；菜单、tooltip 与启动日志都会跟着显示
+
 ROOT = core.ROOT
 LOG_DIR = os.path.join(ROOT, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -66,21 +68,25 @@ for h in (_main, _err, _console):
     root_logger.addHandler(h)
 log = logging.getLogger("app")
 
+# 图标按「点一下会执行什么」的媒体按钮语义：跑着时显示 ⏸（点了就暂停），
+# 停下时显示 ▶︎（点了就开跑）。其它状态是事件指示，显示当时正在干的事。
 ICONS = {
-    "idle": "⏸",
-    "watching": "▶︎",
+    "idle": "▶︎",         # 已停止 → 点图标 = 开始监控
+    "watching": "⏸",      # 监控中 → 点图标 = 暂停
     "ad": "⚡︎",
     "ad_wait": "⏳",      # 倒计时锁定中，等解锁
     "ad_skipped": "⚡︎",
+    "product": "⬅︎",      # 误进商品详情页，正在点左上角返回
     "disconnected": "⚠︎",
     "error": "✕",
 }
 
 STATUS_TEXT = {
-    "idle": "已停止",
-    "watching": "监控中",
+    "idle": "已停止（点图标开始监控）",
+    "watching": "监控中（点图标暂停）",
     "ad": "正在跳过广告",
     "ad_wait": "广告倒计时中，等解锁",
+    "product": "误进商品页，点左上角返回中",
     "disconnected": "镜像未连接",
     "error": "出错",
 }
@@ -105,8 +111,16 @@ class AppDelegate(NSObject):
     def buildMenu(self):
         bar = NSStatusBar.systemStatusBar()
         self.status_item = bar.statusItemWithLength_(NSVariableStatusItemLength)
-        self.status_item.button().setTitle_(ICONS["idle"])
-        self.status_item.button().setToolTip_("短剧去广告")
+        btn = self.status_item.button()
+        btn.setTitle_(ICONS["idle"])
+        btn.setToolTip_(f"短剧去广告 v{VERSION}\n左键点图标 = 开始 / 暂停，右键点 = 菜单")
+        btn.setTarget_(self)
+        btn.setAction_("iconClicked:")     # 默认只在「左键抬起」时触发
+        # ⚠️ PyObjC 没暴露 NSStatusBarButton 的 setSendActionOn_（button 本身与它的 cell
+        # 都没有，调一下就报 AttributeError 并静默中断 buildMenu，图标停在初始值）
+        # → 右键改用全局事件监控抓「右键按下」，落在本图标范围内才弹菜单。
+        self._right_monitor = AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            AppKit.NSEventMaskRightMouseDown, lambda ev: self._maybe_popup_menu(ev))
         self._build_menu_items()
         AppHelper.callLater(1.5, self._log_icon_pos)
 
@@ -174,18 +188,34 @@ class AppDelegate(NSObject):
         item_shots.setTarget_(self)
         menu.addItem_(item_shots)
 
+        item_ver = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            f"版本 v{VERSION}", "", "")
+        item_ver.setEnabled_(False)
+        menu.addItem_(item_ver)
+
         item_quit = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "退出", "quitApp:", "q")
         item_quit.setTarget_(self)
         menu.addItem_(item_quit)
 
-        self.status_item.setMenu_(menu)
+        self.menu = menu
+        # 不再 setMenu_(menu)：那样左键也会弹菜单，图标就当不了「开始/暂停」按钮。
+        # 左键走 iconClicked_（直接切换监控），右键时手动 popUp 这个 menu。
 
     # ---------- 状态刷新 ----------
 
     def refreshUI(self):
         st = self.state
-        self.status_item.button().setTitle_(ICONS.get(st, "⏸"))
+        running = bool(self.monitor and self.monitor.running)
+        icon = ICONS.get(st)
+        if icon is None:                       # 未知状态：按在不在跑给 暂停/播放
+            icon = "⏸" if running else "▶︎"
+        elif running and st in ("idle", "error"):
+            icon = "⏸"                        # 在跑但状态滞后 → 仍是「可暂停」
+        elif not running and st not in ("idle", "error"):
+            icon = "▶︎"                        # 已停但状态未刷 → 仍是「可开始」
+        self.status_item.button().setTitle_(icon)
+        log.debug("图标 → %s（state=%s running=%s）", icon, st, running)
         tip = STATUS_TEXT.get(st, st)
         if self.last_msg:
             tip += "\n" + self.last_msg
@@ -233,6 +263,39 @@ class AppDelegate(NSObject):
         AppHelper.callAfter(apply)
 
     # ---------- 菜单动作 ----------
+
+    def iconClicked_(self, sender):
+        """图标本身的点击：左键 = 开始/暂停切换，右键（或 Ctrl+左键）= 弹菜单。"""
+        ev = NSApp.currentEvent()
+        is_right = (ev is not None
+                    and (ev.type() in (AppKit.NSEventTypeRightMouseDown,
+                                       AppKit.NSEventTypeRightMouseUp)
+                         or (ev.modifierFlags() & AppKit.NSEventModifierFlagControl)))
+        if not is_right:
+            log.info("点图标 → 切换监控（当前 running=%s）",
+                     bool(self.monitor and self.monitor.running))
+            self.toggleMonitor_(sender)
+            return
+        self._maybe_popup_menu(ev)
+
+    @objc.python_method
+    def _maybe_popup_menu(self, ev=None):
+        """弹状态菜单：右键由全局事件监控触发（需确认真的点在本图标上），
+        Ctrl+左键由 iconClicked_ 转发过来。"""
+        try:
+            win = self.status_item.button().window()
+            if win is None:
+                return
+            f = win.frame()
+            m = AppKit.NSEvent.mouseLocation()          # 全局屏幕坐标（原点左下角）
+            if not (f.origin.x <= m.x <= f.origin.x + f.size.width
+                    and f.origin.y <= m.y <= f.origin.y + f.size.height):
+                return                                  # 右键点在别处，与本图标无关
+            log.info("右键/Ctrl+左键点在图标上 → 弹出菜单")
+            self.menu.popUpMenuPositioningItem_atLocation_inView_(
+                None, AppKit.NSMakePoint(0, 0), win.contentView())
+        except Exception as e:
+            log.warning("弹出菜单失败：%s", e)
 
     def toggleMonitor_(self, sender):
         if self.monitor and self.monitor.running:
@@ -387,6 +450,7 @@ class AppDelegate(NSObject):
         threading.Thread(target=run, daemon=True).start()
 
     def applicationDidFinishLaunching_(self, notification):
+        log.info("iPhone 镜像 · 红果短剧去广告 v%s 启动（pid=%d）", VERSION, os.getpid())
         self.buildMenu()
         self.refreshUI()
         self._warmup()

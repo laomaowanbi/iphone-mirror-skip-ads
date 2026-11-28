@@ -70,6 +70,22 @@ FAST_INTERVAL = 0.15   # 检测到画面变暗时的快扫间隔
 DARK_DROP_RATIO = 0.25 # 亮度比上次下降超过这个比例 → 判定「可能进广告」
 FAST_HOLD_TICKS = 15   # 快扫模式最多维持多少轮，之后回落到常态
 
+# ---------------- SCK 采集器（ScreenCaptureKit，避开 iPhone 端截图事件）----------------
+SCK_RAW = "/tmp/frame.raw"
+SCK_META = "/tmp/frame.meta"
+SCK_MAX_AGE = 2.0        # 帧龄超过此秒数 → 采集器已死 → 回退 CG 截图
+SCK_REF = (682, 1502)    # 标定基准分辨率（Retina 2x 下的镜像窗口）
+
+# ---------------- 误滑进商品详情页（广告上滑后进了抖音商城商品页）----------------
+# 商品页左上角只有个白色「<」（无文字），位置按整窗比例定（实测帧 692x1524 上 x≈45 y≈197）
+BACK_REL = {"x": 0.085, "y": 0.133}   # 兜底比例（动态像素定位失败时才用）
+PRODUCT_STRONG = ("券后价", "到手价", "立即购买", "现在下单", "领券抢购", "抢购",
+                  "旗舰店", "购物车", "包邮发货", "品质保障", "售后服务")
+PRODUCT_WEAK = ("客服", "已售", "下单", "领券", "图集", "加入购物车", "评价", "发货", "快递")
+PRODUCT_OCR_SEC = 1.0      # 商品页检测的 OCR 节流
+PRODUCT_BACK_MAX = 3       # 最多连点几次返回（商品生态多层页：详情→视频/图集→…）
+PRODUCT_GIVEUP_SEC = 60    # 点不动就冷却这么久，交给你手动处理
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TEMPLATE_PATH = os.path.join(ROOT, "assets", "template_ad_text.png")
@@ -147,12 +163,65 @@ def center_point(frame):
     return (x + CENTER_REL["x"] * w, y + CENTER_REL["y"] * h)
 
 
+_sck_logged = False
+_sck_fail = 0
+
+
+def grab_sck():
+    """读 sck_grab 采集器输出的整窗帧 → RGB numpy（物理像素）。不可用返回 None。
+
+    采集器用 ScreenCaptureKit 的 SCStream 帧回调取镜像窗口画面，**不是截图 API**，
+    实测不会让 iPhone 产生截图事件 → 红果不再弹「识图找同款」浮窗。
+    """
+    try:
+        with open(SCK_META) as f:
+            w, h, ts = (int(v) for v in f.read().split()[:3])
+    except Exception:
+        return None
+    if w < 2 or h < 2:                          # 镜像窗口消失
+        return None
+    if time.time() - ts / 1000.0 > SCK_MAX_AGE:  # 采集器已停/卡住
+        return None
+    need = w * h * 3
+    try:
+        with open(SCK_RAW, "rb") as f:
+            buf = f.read(need)
+    except Exception:
+        return None
+    if len(buf) < need:                         # 正被原子替换，读到半帧
+        return None
+    return np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
+
+
 def snapshot(frame):
-    """抓监控区，返回 (rgb, gray)。"""
+    """抓监控区，返回 (rgb, gray)。
+
+    优先读 SCK 采集器的整窗帧、按比例裁监控区（iPhone 端零截图事件）；
+    采集器不在时回退旧的 CG 截图（降级可用，但会在 iPhone 端产生截图事件）。
+    """
+    global _sck_logged, _sck_fail
+    arr = grab_sck()
+    if arr is not None:
+        fh, fw = arr.shape[:2]
+        if not _sck_logged:
+            log.info("取帧方式 = SCK 采集器 %dx%d（iPhone 端零截图事件）", fw, fh)
+            _sck_logged = True
+        _sck_fail = 0
+        x0 = int(MONITOR_REL["x0"] * fw)
+        x1 = int(MONITOR_REL["x1"] * fw)
+        y0 = int(MONITOR_REL["y0"] * fh)
+        y1 = int(MONITOR_REL["y1"] * fh)
+        crop = arr[y0:y1, x0:x1]
+        if crop.size:
+            return crop, crop.mean(axis=2)
     bx, by, bw, bh = monitor_box(frame)
     arr = grab_region(bx, by, bw, bh)
     if arr is None:
         return None, None
+    _sck_fail += 1
+    if _sck_fail == 1 or _sck_fail % 60 == 0:
+        log.warning("SCK 采集器不可用（累计 %d 次）→ 回退 CG 截图，会在 iPhone 端产"
+                    "生截图事件（红果可能弹识图浮窗），请先启动 bin/sck_grab", _sck_fail)
     return arr, arr.mean(axis=2)
 
 
@@ -242,6 +311,69 @@ def ocr_looks_like_ad(texts):
     return any(k in joined for k in AD_KEYWORDS_ANY)
 
 
+def product_hits(texts):
+    """OCR 文本里命中的商品页关键词（强特征 + 弱特征合并）。"""
+    blob = "".join(texts)
+    return ([k for k in PRODUCT_STRONG if k in blob]
+            + [k for k in PRODUCT_WEAK if k in blob])
+
+
+def looks_like_product(texts):
+    """强特征命中 1 个，或弱特征命中 2 个 → 认为还停在商品生态里。"""
+    blob = "".join(texts)
+    strong = [k for k in PRODUCT_STRONG if k in blob]
+    weak = [k for k in PRODUCT_WEAK if k in blob]
+    return bool(strong) or len(weak) >= 2, strong + weak
+
+
+def back_point(frame, arr=None):
+    """商品页左上角白色「<」的屏幕绝对坐标。
+
+    优先在帧里用「纯白像素质心」动态定位（商品详情页/视频页/图集页的箭头位置
+    略有不同，固定比例会偏），定位不到时才回退 BACK_REL 比例。
+    """
+    x, y, w, h = frame
+    fb = (x + BACK_REL["x"] * w, y + BACK_REL["y"] * h)
+    a = arr if arr is not None else grab_sck()
+    if a is None:
+        return fb
+    H, W = a.shape[:2]
+    y0, y1 = int(0.10 * H), int(0.18 * H)      # 箭头可能出现的纵向区间
+    seg = a[y0:y1, 0:int(0.20 * W)]            # 只看左侧一条，里面只有箭头是纯白
+    # 只要「纯白」（R/G/B 都高）→ 排掉黄色的「包邮发货」（黄色 B 分量低）
+    m = (seg[:, :, 0] > 190) & (seg[:, :, 1] > 190) & (seg[:, :, 2] > 190)
+    ys, xs = np.where(m)
+    if len(xs) < 30:
+        return fb
+    # 取最靠左的那簇（箭头）：只保留 x <= 最小值+30 的像素，再取质心
+    keep = xs <= xs.min() + 30
+    cx = float(xs[keep].mean())
+    cy = float(ys[keep].mean()) + y0
+    return x + cx / W * w, y + cy / H * h
+
+
+def back_at(px, py):
+    """点商品页左上角返回。节奏与 skip_ad_at 一致：
+
+    镜像需要**先一下点击让窗口接管输入**，第二下才会真的落到 iPhone 上；
+    只点一下会被 macOS 当成普通窗口聚焦，iPhone 端无反应。
+    """
+    orig = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
+    _move_mouse(px, py, steps=3)
+    time.sleep(0.12)
+    _click_at(px, py)                 # 第一下：让镜像接管输入
+    time.sleep(ACT_WAIT_FOCUS)
+    _move_mouse(px, py, steps=3)      # 接管后鼠标可能漂移，重新定位到同一个点
+    time.sleep(0.08)
+    _click_at(px, py)                 # 第二下：真正落在 iPhone 的返回键上
+    time.sleep(0.35)
+    _move_mouse(px, py, steps=3)
+    time.sleep(0.08)
+    _click_at(px, py)                 # 补一下（箭头命中区小，偶尔前两下没中）
+    time.sleep(0.30)
+    Quartz.CGWarpMouseCursorPosition((orig.x, orig.y))
+
+
 # ---------------- 判定 ----------------
 
 _TEMPLATE_CACHE = {}
@@ -317,8 +449,12 @@ def detect(gray, rgb=None, use_ocr=True):
     g = gray.astype(np.float32)
     mean = float(g.mean())
     text_px = int(((g > 100) & (g < 175)).sum())
-    if mean > BRIGHT_MEAN_AD_MAX or text_px < TEXT_PX_MIN:
-        return "PLAYING", {"mean": mean, "text_px": text_px}
+    # 文字像素阈值按监控区面积缩放（基准区 381x120@682x1502，实测广告文字 1109 像素）
+    ref_area = ((MONITOR_REL["x1"] - MONITOR_REL["x0"]) * SCK_REF[0] *
+                (MONITOR_REL["y1"] - MONITOR_REL["y0"]) * SCK_REF[1])
+    text_min = max(40, int(TEXT_PX_MIN * g.shape[0] * g.shape[1] / ref_area))
+    if mean > BRIGHT_MEAN_AD_MAX or text_px < text_min:
+        return "PLAYING", {"mean": mean, "text_px": text_px, "text_min": text_min}
     tpls = load_templates()
     best_score, best_name, best_loc = -1.0, None, None
     gh, gw = g.shape
@@ -485,7 +621,8 @@ class Monitor:
         self._stop = threading.Event()
         self._thread = None
         self.stats = {"checks": 0, "ads": 0, "skipped": 0, "failed": 0,
-                      "disconnected": 0}
+                      "disconnected": 0, "product_page": 0,
+                      "product_back_ok": 0, "product_failed": 0}
         self.last_error = ""
         self._last_conn_check = 0.0
         self._last_frame = None
@@ -496,6 +633,7 @@ class Monitor:
         self._last_near_miss = 0.0
         self._last_fallback_ocr = 0.0
         self._last_countdown = None
+        self._last_product_ocr = 0.0
 
     # ---- 生命周期 ----
     @property
@@ -541,6 +679,67 @@ class Monitor:
                     os.path.basename(path) if path else "无")
         self.on_event("unknown_style", {"detail": detail,
                                         "shot": os.path.basename(path) if path else None})
+
+    # ---- 误进商品生态 → 点左上角返回 ----
+    def _check_product_page(self, frame):
+        """广告上滑后有时会进到抖音商城的商品页（详情/视频/图集），而不是正片。
+
+        OCR 判「还在商品生态」→ 用白像素动态定位左上角「<」→ 点返回。
+        商品生态是多层的（详情页 → 视频/图集页 → …），所以最多连点 PRODUCT_BACK_MAX
+        次，每点一次重新判一次；点不动就冷却 PRODUCT_GIVEUP_SEC 秒交给用户手动处理。
+        返回 True 表示本轮处理过商品页（调用方直接 return）。
+        """
+        now = time.time()
+        if now - self._last_product_ocr < PRODUCT_OCR_SEC:
+            return False
+        self._last_product_ocr = now
+        full = grab_sck()
+        if full is None:
+            full = grab_region(*frame)
+        if full is None:
+            return False
+        ok, hits = looks_like_product(ocr_texts(full))
+        if not ok:
+            return False
+        self.stats["product_page"] += 1
+        shot = (self.save_shot(full, "PRODUCT_PAGE", jpeg_quality=75, scale=0.75)
+                if self.shots_dir else None)
+        log.info("误进商品生态（命中 %s）→ 点左上角返回，存证=%s",
+                 "/".join(hits[:6]), os.path.basename(shot) if shot else "无")
+        left = hits
+        for attempt in range(1, PRODUCT_BACK_MAX + 1):
+            bx, by = back_point(frame, full)
+            log.info("第 %d/%d 次点左上角返回 (%.0f, %.0f)",
+                     attempt, PRODUCT_BACK_MAX, bx, by)
+            self.on_status("product")
+            self.on_event("product_page", {"hits": hits, "x": bx, "y": by,
+                                          "try": attempt})
+            back_at(bx, by)
+            self._stop.wait(1.0)
+            if self._stop.is_set():
+                return True
+            full = grab_sck()
+            if full is None:
+                full = grab_region(*frame)
+            ok, left = (looks_like_product(ocr_texts(full))
+                        if full is not None else (False, []))
+            log.info("点完再判 → 仍在商品生态=%s 命中=%s", ok, left[:5])
+            if not ok:
+                self.stats["product_back_ok"] += 1
+                log.info("已离开商品生态（第 %d 次返回后）", attempt)
+                self.on_status("watching")
+                self.on_event("product_back_ok", {"tries": attempt})
+                break
+        else:
+            self.stats["product_failed"] += 1
+            if self.shots_dir and full is not None:
+                self.save_shot(full, "PRODUCT_STUCK", jpeg_quality=75, scale=0.75)
+            self._last_product_ocr = time.time() + PRODUCT_GIVEUP_SEC
+            log.warning("连点 %d 次仍在商品生态（命中 %s）→ 冷却 %d 秒，交给你手动处理",
+                        PRODUCT_BACK_MAX, "/".join(left[:4]), PRODUCT_GIVEUP_SEC)
+            self.on_event("product_back_failed", {"hits": left})
+        self._fast_left = 0
+        return True
 
     # ---- 自适应频率 ----
     def _update_frequency(self, mean):
@@ -700,6 +899,8 @@ class Monitor:
                     state = "AD"
                     detail = dict(detail, by="OCR兜底", ocr="".join(texts)[:30])
             if state != "AD":
+                if self._check_product_page(frame):
+                    return
                 self._check_near_miss(frame, detail)
             self.on_status("watching")
             return
